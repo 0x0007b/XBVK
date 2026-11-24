@@ -22,7 +22,10 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
+mod console_insn;
 mod crash;
+#[cfg(windows)]
+mod hooks;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
