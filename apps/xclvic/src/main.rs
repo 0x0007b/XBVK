@@ -177,7 +177,23 @@ fn main() -> Result<()> {
             list,
             jobs,
             fallback,
-        } => translate::run(paths, validate, pipelines, list, jobs, fallback),
+        } => {
+            // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped.
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_view_heap_limit(n);
+            }
+            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes.
+            if let Some(n) = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                victory_shader::emit::set_host_max_wave(n);
+            }
+            translate::run(paths, validate, pipelines, list, jobs, fallback)
+        }
         Command::Disasm { file, args } => {
             let code = disasm::run(&file, &args);
             anyhow::ensure!(code == 0, "disasm failed with exit code {code}");

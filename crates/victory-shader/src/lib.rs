@@ -6,6 +6,7 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
@@ -14,8 +15,14 @@ pub mod io;
 pub mod ir;
 pub mod native;
 pub mod resource;
+pub mod spill;
 pub mod structure;
 pub mod xcl_fallback;
+
+/// Compile-time BLAKE3 digest of `victory-shader`'s Rust sources (`src/**/*.rs`),
+/// used to key the persistent shader cache on translator code changes rather than
+/// the full executable binary.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

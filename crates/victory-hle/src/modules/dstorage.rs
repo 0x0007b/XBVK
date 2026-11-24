@@ -18,7 +18,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
@@ -26,10 +26,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::HANDLE;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
+
+mod errors;
+use errors::{ErrorRecord, QueueErrors, ReadFailure};
 
 /// The factory interface Grand Theft Auto VI asks for.
 const FACTORY: Guid = Guid::new(
@@ -132,10 +136,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
+    let filename = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
+        std::slice::from_raw_parts(path, len)
     };
+    let name = String::from_utf16_lossy(filename);
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
@@ -144,7 +149,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            file,
+            filename: filename.into(),
+        },
+    );
     put(out, file)
 }
 
@@ -187,6 +198,9 @@ extern "system" fn create_queue(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes its description (null tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -204,10 +218,13 @@ extern "system" fn create_queue(
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
+    let lane = match Lane::new(desc.priority, desc.capacity) {
+        Ok(lane) => lane,
+        Err(hr) => return hr,
+    };
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
@@ -258,6 +275,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    filename: Box<[u16]>,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -368,10 +386,12 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, QueuedRead)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
-    failures: BTreeMap<u64, HRESULT>,
+    /// First completed failure since the previous status entry.
+    first_status_failure: Option<HRESULT>,
+    errors: QueueErrors,
     closed: bool,
 }
 
@@ -384,7 +404,7 @@ unsafe impl Send for Lane {}
 struct Job {
     lane: u64,
     seq: u64,
-    request: Request,
+    request: QueuedRead,
     staging: u64,
 }
 
@@ -450,9 +470,11 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let failure = execute(&job.request.request)
+            .err()
+            .map(|hr| Box::new(ReadFailure::new(&job.request.request, hr)));
         lanes = scheduler.lock();
-        lanes.finish(&job, result);
+        lanes.finish(&job, failure);
         lanes.count(&job, started);
         if std::mem::take(&mut lanes.starved) {
             scheduler.work.notify_all();
@@ -464,12 +486,13 @@ fn work(scheduler: &'static Scheduler) {
 impl Lanes {
     /// Counts a finished request; every 5 s a debug line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
+        let req = &job.request.request;
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
-        *bytes += u64::from(job.request.destination_size);
+        *bytes += u64::from(req.destination_size);
         *busy += started.elapsed();
-        if job.request.options & BCPACK != 0 {
-            self.bcpack.0 += u64::from(job.request.destination_size);
+        if req.options & BCPACK != 0 {
+            self.bcpack.0 += u64::from(req.destination_size);
             self.bcpack.1 += started.elapsed();
         }
         let since = *self.since.get_or_insert(started);
@@ -495,31 +518,27 @@ impl Lanes {
         }
     }
 
-    /// Starts the next read of the class with the least virtual time, from
-    /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// Starts the next read in scheduler order. If it must wait for
+    /// staging, an unstaged read at the head of another queue can run
+    /// without using the space the waiting read needs.
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let (mut id, mut staging) = self.next_read(|_| true)?;
+        if staging != 0 && self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
-            return None;
+            (id, staging) = self.next_read(|bytes| bytes == 0)?;
         }
-        lane.reads.pop_front();
+        let lane = self.lanes.get_mut(&id)?;
+        let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
-        let size = u64::from(request.destination_size.max(request.source_size)).max(1);
-        self.now = self.clock[class];
+        let class = lane.class;
+        let size = u64::from(request.request.destination_size.max(request.request.source_size)).max(1);
+        // Starting an unstaged read can temporarily skip an older virtual
+        // time. Keep the clocks used by newly active queues moving forward.
+        self.now = self.now.max(self.clock[class]);
         self.clock[class] += size * COST[class];
-        self.lane_now[class] = lane.clock;
+        self.lane_now[class] = self.lane_now[class].max(lane.clock);
         lane.clock += size;
         Some(Job {
             lane: id,
@@ -529,12 +548,31 @@ impl Lanes {
         })
     }
 
-    fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
+    fn next_read(&self, eligible: impl Fn(u64) -> bool) -> Option<(u64, u64)> {
+        self.lanes
+            .iter()
+            .filter_map(|(&id, lane)| {
+                let (seq, request) = lane.reads.front()?;
+                let staging = staging_bytes(&request.request);
+                eligible(staging).then_some((
+                    self.clock[lane.class],
+                    lane.class,
+                    lane.clock,
+                    *seq,
+                    id,
+                    staging,
+                ))
+            })
+            .min()
+            .map(|(_, _, _, _, id, staging)| (id, staging))
+    }
+
+    fn finish(&mut self, job: &Job, failure: Option<Box<ReadFailure>>) {
         self.staged -= job.staging;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
-            if let Err(hr) = result {
-                lane.failures.insert(job.seq, hr);
+            if let Some(failure) = failure {
+                lane.errors.defer(job.seq, failure);
             }
             lane.flush();
         }
@@ -573,8 +611,8 @@ impl Lanes {
 }
 
 impl Lane {
-    fn new(priority: i8, capacity: u16) -> Lane {
-        Lane {
+    fn new(priority: i8, capacity: u16) -> Result<Self, HRESULT> {
+        Ok(Self {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
             clock: 0,
@@ -582,9 +620,10 @@ impl Lane {
             reads: VecDeque::new(),
             statuses: VecDeque::new(),
             running: BTreeSet::new(),
-            failures: BTreeMap::new(),
+            first_status_failure: None,
+            errors: QueueErrors::new()?,
             closed: false,
-        }
+        })
     }
 
     /// Requests and status entries held, submitted or not.
@@ -592,24 +631,24 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
-    /// Writes the status entries whose earlier reads have all finished.
+    /// Publishes completed errors and writes ready status entries in queue order.
     fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
-            let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
-                return;
-            }
-            let Some((_, status)) = self.statuses.pop_front() else {
-                return;
-            };
-            let later = self.failures.split_off(&seq);
-            let first = std::mem::replace(&mut self.failures, later)
-                .into_values()
-                .next();
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
+        let next_read = self
+            .reads
+            .front()
+            .map(|(seq, _)| *seq)
+            .into_iter()
+            .chain(self.running.first().copied())
+            .min()
+            .unwrap_or(u64::MAX);
+        while let Some(&(seq, _)) = self.statuses.front().filter(|(seq, _)| *seq < next_read) {
+            let failure = self.errors.publish_before(seq);
+            let result = self.first_status_failure.take().or(failure).unwrap_or(S_OK);
+            let (_, status) = self.statuses.pop_front().unwrap();
+            status.entry().store(result, Ordering::Release);
         }
+        let failure = self.errors.publish_before(next_read);
+        self.first_status_failure = self.first_status_failure.or(failure);
     }
 }
 
@@ -672,6 +711,12 @@ struct Request {
     name: *const c_char,
 }
 
+impl Request {
+    fn has_supported_options(&self) -> bool {
+        self.options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) == 0
+    }
+}
+
 // Request options.
 /// Inflate zlib (RFC 1950) data.
 const ZLIB: u64 = 1;
@@ -684,8 +729,39 @@ const MEMORY_SOURCE: u64 = 1 << 22;
 
 const PAGE: usize = 64 * 1024;
 
+
+fn is_file_source(request: &Request) -> bool {
+    const SUPPORTED: u64 = ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE;
+    request.options & !SUPPORTED == 0
+        && request.options & MEMORY_SOURCE == 0
+        && !request.source.is_null()
+}
+
+
+struct QueuedRead {
+    request: Request,
+}
+
+impl QueuedRead {
+    fn new(request: Request) -> Self {
+        if is_file_source(&request) {
+            add_ref_instance(request.source.cast::<Instance<File>>());
+        }
+        Self { request }
+    }
+}
+
+impl Drop for QueuedRead {
+    fn drop(&mut self) {
+        if is_file_source(&self.request) {
+            release(self.request.source.cast_mut().cast::<Instance<File>>());
+        }
+    }
+}
+
+
 enum Command {
-    Read(Request),
+    Read(QueuedRead),
     Status(Status),
 }
 
@@ -714,7 +790,7 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    queue(this, Command::Read(QueuedRead::new(request)));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -784,6 +860,33 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+extern "system" fn get_error_event(this: QueueRef) -> HANDLE {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    scheduler()
+        .and_then(|scheduler| {
+            let lanes = scheduler.lock();
+            lanes.lanes.get(&id).map(|lane| lane.errors.duplicate_event())
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+extern "system" fn retrieve_error_record(this: QueueRef, out: *mut ErrorRecord) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let record = scheduler()
+        .and_then(|scheduler| {
+            let mut lanes = scheduler.lock();
+            lanes.lanes.get_mut(&id).map(|lane| lane.errors.take())
+        })
+        .unwrap_or_default();
+    // SAFETY: the title supplies room for its error record.
+    unsafe { out.write(record) };
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -801,7 +904,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         );
         hr
     };
-    if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
+    if !request.has_supported_options() {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
     if request.source.is_null() || request.destination.is_null() {
@@ -977,6 +1080,16 @@ fn into_destination(
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
+        // Said aloud: Grand Theft Auto VI never reads a request's result
+        // (it only polls for completion), so a destination left unwritten
+        // is a model or texture that silently holds whatever its pages
+        // held before.
+        tracing::warn!(
+            offset,
+            len,
+            pages = pages.len(),
+            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+        );
         Err(E_INVALIDARG)
     }
 }
@@ -993,8 +1106,8 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     submit as *const (),          // 0x30
     missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
     close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
+    get_error_event as *const (),        // 0x48
+    retrieve_error_record as *const (), // 0x50
     missing::<11> as *const (),   // 0x58 (2020: queue info)
 ]);
 
@@ -1009,7 +1122,11 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     use super::*;
     use crate::modules::xgameruntime::method;
@@ -1106,6 +1223,19 @@ mod tests {
         f(object);
     }
 
+    fn error_event(queue: *mut c_void) -> OwnedHandle {
+        let get: extern "system" fn(*mut c_void) -> HANDLE = call(queue, 0x48);
+        let handle = get(queue);
+        assert!(!handle.is_null());
+        // SAFETY: the queue returned a caller-owned event handle.
+        unsafe { OwnedHandle::from_raw_handle(handle) }
+    }
+
+    fn poll_event(event: &OwnedHandle) -> u32 {
+        // SAFETY: the caller holds the event.
+        unsafe { WaitForSingleObject(event.as_raw_handle(), 0) }
+    }
+
     fn result(array: *mut c_void, index: u32) -> HRESULT {
         let f: extern "system" fn(*mut c_void, u32) -> HRESULT = call(array, 0x20);
         f(array, index)
@@ -1176,6 +1306,29 @@ mod tests {
         void(queue, 0x40);
     }
 
+
+    #[test]
+    fn releasing_file_after_enqueue_keeps_it_alive() {
+        let contents = pattern(4096);
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut out = vec![0u8; 512];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 512, file, 1024, 512));
+        enqueue_status(queue, array, 0);
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        assert_eq!(rel(file), 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(out, contents[1024..1536]);
+        void(queue, 0x40);
+
+        let (_dir2, file2) = file_with(&contents);
+        let queue2 = new_queue(0);
+        enqueue(queue2, &request(0, out.as_mut_ptr().cast(), 16, file2, 0, 16));
+        assert_eq!(rel(file2), 1);
+        void(queue2, 0x40);
+    }
+
     #[test]
     fn memory_sources_inflate_too() {
         let plain = pattern(70_000);
@@ -1231,6 +1384,106 @@ mod tests {
     }
 
     #[test]
+    fn queue_reports_and_retrieves_read_errors() {
+        let contents = pattern(64);
+        let (dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(2));
+        let idle_queue = new_queue(0);
+        let event = error_event(queue);
+        let idle_event = error_event(idle_queue);
+        drop(error_event(queue)); // Each caller can close its own handle.
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+
+        let mut buffers = [[0u8; 16]; 3];
+        let [short, bad_zlib, out] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let mut first = request(0, short, 16, file, 60, 16);
+        first.name = c"short read".as_ptr();
+        first.tag = 23;
+        enqueue(queue, &first);
+        enqueue(queue, &request(ZLIB, bad_zlib, 16, file, 0, 16));
+        enqueue_status(queue, array, 0);
+        enqueue(queue, &request(0, out, 16, file, 8, 16));
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(result(array, 0), END_OF_FILE);
+        assert_eq!(buffers[2], contents[8..24]);
+        assert_eq!(poll_event(&event), WAIT_OBJECT_0);
+        assert_eq!(poll_event(&idle_event), WAIT_TIMEOUT);
+
+        #[repr(C)]
+        struct Guarded {
+            before: u64,
+            record: ErrorRecord,
+            after: u64,
+        }
+        let mut out = Guarded {
+            before: 17,
+            record: ErrorRecord::default(),
+            after: 29,
+        };
+        let retrieve: extern "system" fn(*mut c_void, *mut ErrorRecord) = call(queue, 0x50);
+        retrieve(queue, std::ptr::null_mut());
+        retrieve(queue, &mut out.record);
+        assert_eq!((out.before, out.after), (17, 29));
+        assert_eq!(out.record.failure_count, 2);
+        let metadata = &out.record.first;
+        assert_eq!(metadata.result, END_OF_FILE);
+        assert_eq!(metadata.command_type, 0);
+        assert_eq!(metadata.options, first.options);
+        assert_eq!(metadata.destination, short as usize);
+        assert_eq!(metadata.destination_size, 16);
+        assert_eq!(metadata.file_offset, 60);
+        assert_eq!(metadata.source, 0);
+        assert_eq!(metadata.source_size, 16);
+        assert_eq!(metadata.tag, 23);
+        assert_eq!(&metadata.name[..11], b"short read\0");
+        let filename: Vec<_> = dir
+            .path()
+            .join("data.bin")
+            .as_os_str()
+            .encode_wide()
+            .take(metadata.filename.len() - 1)
+            .chain([0])
+            .collect();
+        assert_eq!(&metadata.filename[..filename.len()], filename.as_slice());
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+        retrieve(queue, &mut out.record);
+        assert_eq!(
+            (out.record.failure_count, out.record.first.command_type),
+            (0, -1),
+        );
+
+        // A later failure starts a fresh record. Retrieve while the event
+        // is still signaled, before a wait can consume the signal.
+        // Use a live file object so an accidental lookup returns its filename.
+        let unsupported = Request {
+            options: 1 << 23, // Physical-page source.
+            ..first
+        };
+        enqueue(queue, &unsupported);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), E_NOTIMPL);
+        retrieve(queue, &mut out.record);
+        assert_eq!(
+            (out.record.failure_count, out.record.first.result),
+            (1, E_NOTIMPL),
+        );
+        assert_eq!(out.record.first.options, unsupported.options);
+        assert_eq!(out.record.first.file_offset, 0);
+        assert_eq!(out.record.first.filename[0], 0);
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+
+        for object in [queue, idle_queue, array, file] {
+            let release: extern "system" fn(*mut c_void) -> u32 = call(object, 0x10);
+            assert_eq!(release(object), 0);
+        }
+        // Closing the queue releases its handle. The caller's stays valid.
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+    }
+
+    #[test]
     fn half_a_queue_submits_itself() {
         let (_dir, file) = file_with(&pattern(64));
         let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
@@ -1275,15 +1528,15 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(QueuedRead::new(r)));
     }
 
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
+        l.lanes.insert(0, Lane::new(0, 4096).unwrap());
+        l.lanes.insert(1, Lane::new(1, 4096).unwrap());
+        l.lanes.insert(2, Lane::new(2, 4096).unwrap()); // real-time: as high
         for _ in 0..400 {
             for id in 0..3 {
                 read(&mut l, id, 0, 4096);
@@ -1294,7 +1547,7 @@ mod tests {
         for _ in 0..330 {
             let job = l.start().unwrap();
             started[job.lane as usize] += 1;
-            l.finish(&job, Ok(()));
+            l.finish(&job, None);
         }
         // Normal gets about a tenth of what high and real-time get together.
         assert_eq!(started[1] + started[2], 300, "{started:?}");
@@ -1305,14 +1558,14 @@ mod tests {
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
         l.submit(0);
         let first = l.start().unwrap();
         assert!(l.start().is_none(), "60 + 60 > 100");
-        l.finish(&first, Ok(()));
+        l.finish(&first, None);
         let second = l.start().unwrap();
         let raw = l.start().unwrap();
         assert_eq!((second.staging, raw.staging), (60, 0));
@@ -1320,14 +1573,62 @@ mod tests {
         read(&mut l, 0, ZLIB, 500);
         l.submit(0);
         assert!(l.start().is_none());
-        l.finish(&second, Ok(()));
+        l.finish(&second, None);
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_wait_does_not_block_an_independent_raw_read() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(1, 64).unwrap());
+        l.lanes.insert(1, Lane::new(-1, 64).unwrap());
+        l.lanes.insert(2, Lane::new(1, 64).unwrap());
+        read(&mut l, 0, ZLIB, 60);
+        l.submit(0);
+        let active = l.start().unwrap();
+
+        read(&mut l, 1, ZLIB, 60);
+        read(&mut l, 1, 0, 1000);
+        l.submit(1);
+        read(&mut l, 2, 0, 1000);
+        read(&mut l, 2, ZLIB, 10);
+        l.submit(2);
+
+        let raw = l.start().expect("independent raw read uses no staging");
+        assert_eq!((raw.lane, raw.staging), (2, 0));
+        assert_eq!(l.staged, 60);
+        assert!(l.starved);
+        assert!(
+            l.start().is_none(),
+            "the waiting request keeps first claim on staging"
+        );
+
+        let now = l.now;
+        l.finish(&active, None);
+        let buffered = l.start().unwrap();
+        assert_eq!((buffered.lane, buffered.staging), (1, 60));
+        assert_eq!(l.now, now);
+    }
+
+    #[test]
+    fn oversized_buffered_read_can_run_alongside_an_unstaged_read() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
+        read(&mut l, 0, ZLIB, 120);
+        read(&mut l, 0, ZLIB | MEMORY_SOURCE, 1000);
+        l.submit(0);
+
+        let oversized = l.start().unwrap();
+        assert_eq!(oversized.staging, 120);
+        let memory = l.start().expect("memory source uses no staging");
+        assert_eq!(memory.staging, 0);
+        assert_eq!(l.staged, 120);
     }
 
     #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
@@ -1345,12 +1646,53 @@ mod tests {
         l.submit(0);
         let jobs: Vec<Job> = (0..3).map(|_| l.start().unwrap()).collect();
         // The last read and the first finish; the second then fails.
-        l.finish(&jobs[2], Ok(()));
-        l.finish(&jobs[0], Ok(()));
+        l.finish(&jobs[2], None);
+        l.finish(&jobs[0], None);
         let results = || (result(array.cast(), 0), result(array.cast(), 1));
         assert_eq!(results(), (E_PENDING, E_PENDING));
-        l.finish(&jobs[1], Err(INVALID_DATA));
+        let failure = ReadFailure::new(&jobs[1].request.request, INVALID_DATA);
+        l.finish(&jobs[1], Some(Box::new(failure)));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+    }
+
+    #[test]
+    fn error_event_reports_failures_in_enqueue_order_without_status_entries() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 64).unwrap());
+        read(&mut l, 0, MEMORY_SOURCE, 16);
+        read(&mut l, 0, MEMORY_SOURCE, 16);
+        l.submit(0);
+        let data = [0u8; 16];
+        let mut first = l.start().unwrap();
+        first.request.request.source = data.as_ptr().cast();
+        let second = l.start().unwrap();
+        let handle = l.lanes[&0].errors.duplicate_event();
+        assert!(!handle.is_null());
+        // SAFETY: a new duplicate owned by the test.
+        let event = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let failure = ReadFailure::new(&second.request.request, INVALID_DATA);
+        l.finish(&second, Some(Box::new(failure)));
+        assert_eq!(poll_event(&event), WAIT_TIMEOUT);
+        assert_eq!(l.lanes.get_mut(&0).unwrap().errors.take().failure_count, 0);
+
+        let failure = ReadFailure::new(&first.request.request, END_OF_FILE);
+        l.finish(&first, Some(Box::new(failure)));
+        assert_eq!(poll_event(&event), WAIT_OBJECT_0);
+        let record = l.lanes.get_mut(&0).unwrap().errors.take();
+        assert_eq!((record.failure_count, record.first.result), (2, END_OF_FILE));
+        assert_eq!(record.first.source, data.as_ptr() as usize);
+        assert_eq!(record.first.file_offset, 0);
+        assert!(record.first.filename.iter().all(|&unit| unit == 0));
+
+        // A status entry submitted after retrieval still sees the failure.
+        let array = status_array(1).cast::<Instance<StatusArray>>();
+        add_ref_instance(array);
+        let lane = l.lanes.get_mut(&0).unwrap();
+        lane.unsubmitted
+            .push(Command::Status(Status { array, index: 0 }));
+        l.submit(0);
+        assert_eq!(result(array.cast(), 0), END_OF_FILE);
+        assert_eq!(release(array), 0);
     }
 
     #[test]
