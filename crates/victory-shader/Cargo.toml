@@ -12,6 +12,9 @@ thiserror.workspace = true
 miniz_oxide.workspace = true
 xcl-core.workspace = true
 
+[build-dependencies]
+blake3.workspace = true
+
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
 host = ["dep:windows"]
