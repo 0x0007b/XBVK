@@ -6,7 +6,7 @@
 
 ## Current Status & Active Work
 
-**Status: Pre-alpha (under active development; not playable in-world yet).**
+**Status: Pre-alpha (under active development; in-world 4fps, shaders works).**
 
 ### What works today
 - **Loader & PE/TLS runtime (`victory-loader`, `victory-pe`):** Maps title executables and DLLs in-process (releasing raw PE buffers immediately after mapping to lower peak RAM), rewrites static TLS accesses, emulates console-only Zen 2 CPU instructions (`clzero`, etc.) via vectored exception handling, supports runtime hooking (`hooks`) and byte patching via `XCLVIC_PATCH`, and writes `module+rva` crash backtraces to `crashes.log`.
