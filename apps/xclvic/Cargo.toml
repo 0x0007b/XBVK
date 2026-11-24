@@ -1,0 +1,42 @@
+[package]
+name = "xclvic"
+description = "Unified Xbox Series X|S compatibility layer (VIctory + XCL + Palmwave)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+victory-core.workspace = true
+victory-pe.workspace = true
+victory-loader.workspace = true
+victory-hle.workspace = true
+victory-shader = { workspace = true, features = ["host"] }
+victory-game.workspace = true
+xcl-core.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+] }
+
+[features]
+diagnostics = [
+    "victory-core/diagnostics",
+    "victory-hle/diagnostics",
+    "victory-loader/diagnostics",
+    "victory-shader/diagnostics",
+]
+
+[lints]
+workspace = true
