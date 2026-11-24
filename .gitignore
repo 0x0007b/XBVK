@@ -1,0 +1,74 @@
+# Build output
+/target/
+/tests/fixtures/*/target/
+
+# Reference clones
+/repos/
+
+# Local configuration & outputs
+/victory.toml
+/xclvic.toml
+/launch_gta6*.cmd
+/AGENTS.md
+/.agents/
+/game/
+/games/
+/assets/
+/data/
+/dump/
+/dumps/
+/extracted/
+/cache/
+/out/
+
+# Executables, libraries, symbols
+*.exe
+*.dll
+*.pdb
+*.lib
+*.sys
+*.obj
+*.exp
+*.ilk
+
+# Console packages and containers
+*.xvd
+*.xvc
+*.msixvc
+*.xsp
+*.cab
+*.msi
+
+# Typical game data
+*.bin
+!/crates/victory-formats/src/bcpack-tables.bin
+!/tests/data/bcpack/*.bin
+*.dat
+*.pak
+*.rpf
+*.dds
+*.ktx
+*.ktx2
+*.dxbc
+*.dxil
+*.cso
+*.spv
+*.wav
+*.xma
+*.ogg
+*.opus
+*.mp3
+*.mp4
+*.bik
+*.bk2
+*.awc
+*.zip
+*.7z
+*.rar
+
+# Editor / OS noise
+.vs/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
