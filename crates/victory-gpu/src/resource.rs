@@ -244,22 +244,27 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
+/// The Series S profile also renders light to R9G9B9E5 (67) targets with
+/// unordered access (full screen), which NVIDIA refuses as well (the device
+/// was removed in the menus): there R11G11B10_FLOAT (26) stands in, three
+/// unsigned floats of 4 bytes, the same range within 0.2%, with 6 and 5
+/// bits of mantissa instead of 9.
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
-            STAND_INS.map(|(f, _)| {
+            STAND_INS.map(|(f, to)| {
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -279,7 +284,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in format of the same channels does");
                 }
                 refused
             })
@@ -1336,36 +1341,75 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
+    if make {
+        r.host.used.store(crate::host::moment(), Relaxed);
+    }
     made.clone()
 }
 
 /// The host copy of title texture `this` if it is made, without making it
 /// (for diagnostics, which must not count as a use).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn host_made<'a>(
+pub(crate) fn host_made(
     this: This,
-) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     if this.is_null() {
         return None;
     }
     let (host, _) = hosted(this, false)?;
-    // SAFETY: as in `host_resource`.
-    Some(unsafe { &*std::ptr::from_ref(&host.texture) })
+    Some(host.texture.clone())
+}
+
+/// Returns available physical PC memory in bytes (`u64::MAX` if the query fails).
+#[cfg(windows)]
+fn available_physical_memory() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data filled by `GlobalMemoryStatusEx`.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: sized output structure.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return u64::MAX;
+    }
+    m.ullAvailPhys
+}
+
+/// Checks whether local VRAM plus shared PC memory spillover remain within
+/// `percent` of `budget` (accounting for `reserve` bytes kept for card copies
+/// of title buffers) and the PC is not in acute physical-memory starvation.
+fn has_video_room(vmem: [u64; 4], avail_phys: u64, reserve: u64, percent: u64) -> bool {
+    const MIN_FREE_PHYS: u64 = 256 << 20;
+    let [budget, used, _shared_budget, shared_used] = vmem;
+    avail_phys >= MIN_FREE_PHYS
+        && under_share(budget, used, reserve, percent)
+        && under_share(budget, used.saturating_add(shared_used), reserve, percent)
+}
+
+/// Whether the card's memory in use, with `reserve` bytes kept for copies
+/// of title buffers not made yet, is under `percent` of `budget` ([`room`]).
+fn under_share(budget: u64, used: u64, reserve: u64, percent: u64) -> bool {
+    used.saturating_add(reserve) < budget / 100 * percent
+}
+
+/// [`room`]'s share of the card's budget, in percent.
+#[cfg(windows)]
+pub(crate) fn room_share() -> u64 {
+    room_percent()
 }
 
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
-/// instead). Past the budget the system moves the card's memory into the
-/// PC's, which ended runs 20 and 24.
+/// up to `FLOOR` bytes of them (unless the PC is critically low on RAM), beyond
+/// that while local VRAM plus shared memory spillover stay under nine tenths
+/// of the card's budget ([`room_percent`] says another share, less what is
+/// kept for copies of title buffers not made yet, `shadow::card_reserve`;
+/// `VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes instead).
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const FLOOR: u64 = 2 << 30;
     const WITHOUT_BUDGET: u64 = 4 << 30;
+    const MIN_FREE_PHYS: u64 = 256 << 20;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
@@ -1375,13 +1419,35 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
+    let avail_phys = available_physical_memory();
+    if avail_phys < MIN_FREE_PHYS {
+        return false;
+    }
     if filled < FLOOR {
         return true;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+        Some(vmem) => has_video_room(vmem, avail_phys, crate::shadow::card_reserve(), room_percent()),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The share of the card's budget, in percent, up to which host copies of
+/// textures picked by index are made ([`room`]): 90 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
+/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
+/// textures wait (runs 170-174); the card copies of title buffers from
+/// 1 MiB up take 449 MB more of the card than before (941 against 492),
+/// and 94 gives the textures about that much back.
+#[cfg(windows)]
+fn room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(90, |percent| percent.clamp(50, 97))
+    })
 }
 
 /// Lets go of the host copies of textures the title fills that nothing
@@ -1404,37 +1470,55 @@ pub(crate) fn room() -> bool {
 /// shortcut: [`host_resource`] hands out the host texture without holding
 /// it; a thread that asked for it and has not yet recorded its use (which
 /// makes the list or the slot hold it) is protected by that idle time alone.
-/// Every caller uses it at once, within the title's call.
-/// Called before a submission starts, by the thread that submits.
-/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+/// Whether [`let_go_idle`] and [`evict_placed_in`] let host copies go at
+/// all: `VICTORY_TEXTURE_SWEEP=0` keeps every one.
 #[cfg(windows)]
-pub(crate) fn let_go_idle() {
-    use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
-    const IDLE_FRAMES: u64 = 4;
+fn sweeping() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
-        return;
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+}
+
+/// Whether two half-open byte ranges share a byte: `[a_start, a_start +
+/// a_len)` and `[b_start, b_start + b_len)`. A range of no bytes shares
+/// none, and the ranges end at the last address there is.
+pub(crate) fn ranges_overlap(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
     }
-    // For the trail (`crate::host::trail`): how many went, their bytes,
-    // and the first one.
+    a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+}
+
+/// Lets go of the host copies of the placed textures the title fills that
+/// `[base, base + len)` covers, at once: the runtime unmapped or moved
+/// those pages of title memory (`crate::title_memory_remapped`), so what
+/// those host copies were filled from is gone and a copy of it is memory
+/// held for a texture the title has finished with.
+#[cfg(windows)]
+pub(crate) fn evict_placed_in(base: u64, len: u64) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !sweeping() || len == 0 {
+        return 0;
+    }
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+        if !r.host.placed.load(Relaxed) || !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let size = footprint(&r.desc).map_or(0, |f| f.size);
+        if !ranges_overlap(r.data() as u64, size, base, len) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
-                    && std::sync::Arc::strong_count(host) == 1
+            let only_here = made.as_ref().is_some_and(|(host, _)| {
+                std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
-            if idle {
+            if only_here {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
@@ -1453,6 +1537,92 @@ pub(crate) fn let_go_idle() {
                 first = Some(at);
             }
             crate::host::retire(host);
+        }
+    }
+    if went > 0 {
+        crate::host::trail(|| {
+            format!(
+                "unmapped: {went} host copies of placed textures let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                bytes >> 10,
+                first.unwrap_or(0)
+            )
+        });
+    }
+    went
+}
+
+/// Lets go of the host copies of textures the title fills that nothing
+/// names any more: placed textures were never released (one host texture
+/// per address and description ever viewed: 18,639 of them, 2.5 GB, after
+/// two and a half minutes in the world, 240,000,000 ns at the next
+/// device-loss check). Nothing holds its own memory past `IDLE_MS` since it
+/// was last used; what holds a host reference outside the pool (whatever
+/// makes the list or the slot hold it) is protected by that idle time alone.
+/// Every caller uses it at once, within the title's call.
+/// Called before a submission starts, by the thread that submits.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(windows)]
+pub(crate) fn let_go_idle() {
+    use std::sync::atomic::Ordering::Relaxed;
+    const IDLE_MS: u64 = 5_000;
+    const IDLE_FRAMES: u64 = 4;
+    if !sweeping() {
+        return;
+    }
+    // For the trail (`crate::host::trail`): how many went, their bytes,
+    // and the first one.
+    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        let title_filled = fills(&r.desc) && !crate::texture::host_wrote(at);
+        if !title_filled {
+            // Render targets / depth / UAV textures hold GPU-rendered contents
+            // and are kept while their backing memory is live. Only evict a
+            // placed one once the title has unmapped its backing pages.
+            let unmapped_placed = r.host.placed.load(Relaxed)
+                && !crate::texture::committed(r.data().cast_const(), 1);
+            if !unmapped_placed {
+                continue;
+            }
+        }
+        let gone = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = made.as_ref().is_some_and(|(host, twin)| {
+                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && std::sync::Arc::strong_count(host) == 1
+                    && crate::host::references(&host.texture) == 1
+                    && twin.as_ref().is_none_or(|t| {
+                        std::sync::Arc::strong_count(t) == 1
+                            && crate::host::references(&t.colour.texture) == 1
+                    })
+            });
+            if idle {
+                // Under the lock: the next use must not find the staging
+                // state of the texture let go (it says "uploaded").
+                crate::texture::unstage(at as This);
+                made.take()
+            } else {
+                None
+            }
+        };
+        if let Some((host, twin)) = gone {
+            r.host.gone.store(true, Relaxed);
+            if title_filled {
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+            }
+            went += 1;
+            bytes += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
+            if first.is_none() {
+                first = Some(at);
+            }
+            crate::host::retire(host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
         }
     }
     if went > 0 {
@@ -2018,6 +2188,24 @@ pub(crate) extern "system" fn create_at_address(
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// The placed textures asked for with filler words set, as asked
+/// (address and description): for [`PLACED_TWINS`].
+#[cfg(windows)]
+static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Placed textures asked for a second time with other filler words in
+/// their description: each was a second resource and host copy before the
+/// filler was left out of the key ([`texture_at`]).
+#[cfg(windows)]
+static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`PLACED_TWINS`].
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn placed_filler_twins() -> u64 {
+    PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The bytes of title memory a texture with the resource description
 /// `desc` (as words) takes where the title placed it; `None` for a buffer
 /// and for a description without a size.
@@ -2031,11 +2219,45 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
     footprint(&d).map(|f| f.size)
 }
 
+/// Normalizes a placed resource description for keying: words 1 and 13 are
+/// struct padding (after `dimension`, and at the end) where the title leaves
+/// uninitialized stack values, so two views of the same texture can differ
+/// only there. `VICTORY_PLACED_FILLER=1` keeps them unchanged.
+#[cfg(windows)]
+pub(crate) fn placed_desc_key(desc: &[u32; 14]) -> [u32; 14] {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut key = *desc;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        key[1] = 0;
+        key[13] = 0;
+    }
+    key
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let raw = *desc;
+    let key = placed_desc_key(desc);
+    let desc = &key;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    // How many resources the filler alone would have added (a count for
+    // the log: `placed_filler_twins`).
+    if raw != key {
+        let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.insert((address, raw)) {
+            let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
+                let mut blank = *r;
+                blank[1] = 0;
+                blank[13] = 0;
+                blank == key
+            });
+            if others.count() > 1 {
+                PLACED_TWINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -2058,6 +2280,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
+    crate::texture::placed_in_host_written(address, desc);
     resource(out)
         .host
         .placed
@@ -2239,6 +2462,20 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_reserve_for_card_copies_counts_as_used() {
+        const MB: u64 = 1 << 20;
+        let budget = 10_000 * MB;
+        // 8.5 GB in use, the textures' share 90%: room, without the reserve.
+        assert!(super::under_share(budget, 8_500 * MB, 0, 90));
+        // A gigabyte kept for card copies not made yet: no room for textures.
+        assert!(!super::under_share(budget, 8_500 * MB, 1_024 * MB, 90));
+        // Once the copies are made (reserve spent), room again.
+        assert!(super::under_share(budget, 8_500 * MB, 0, 90));
+        // No overflow at the edges.
+        assert!(!super::under_share(budget, u64::MAX, u64::MAX, 90));
+    }
+
     use super::*;
     use crate::object::slot;
 
@@ -2320,6 +2557,33 @@ mod tests {
             create_heap(std::ptr::null(), &bad, &HEAP_IIDS[0], &mut out),
             E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn ranges_overlap_handles_boundaries_zero_len_and_overflow() {
+        // Side by side, in both orders: nothing shared.
+        assert!(!ranges_overlap(0, KIB_64, KIB_64, KIB_64));
+        assert!(!ranges_overlap(KIB_64, KIB_64, 0, KIB_64));
+        // A byte of one inside the other: shared.
+        assert!(ranges_overlap(0, KIB_64, KIB_64 - 1, KIB_64));
+        assert!(ranges_overlap(KIB_64 - 1, KIB_64, 0, KIB_64));
+        // One wholly inside the other: shared, and either way round.
+        assert!(ranges_overlap(0, 4 * KIB_64, KIB_64, KIB_64));
+        assert!(ranges_overlap(KIB_64, KIB_64, 0, 4 * KIB_64));
+        // Nothing at all shares nothing, wherever it is.
+        assert!(!ranges_overlap(0, 0, 0, KIB_64));
+        assert!(!ranges_overlap(0, KIB_64, 0, 0));
+        assert!(!ranges_overlap(0, 0, 0, 0));
+        assert!(!ranges_overlap(u64::MAX, 0, u64::MAX, 0));
+        // A range running off the end of the address space does not wrap
+        // into a false `true`: `saturating_add` stops it at the last
+        // address, so what starts there ends there too. No title address
+        // comes near, and nothing panics.
+        assert!(!ranges_overlap(u64::MAX, u64::MAX, 0, 1));
+        assert!(!ranges_overlap(0, 1, u64::MAX, 1));
+        assert!(!ranges_overlap(u64::MAX, 1, u64::MAX, 1));
+        assert!(ranges_overlap(u64::MAX - 1, 1, u64::MAX - 1, 1));
+        assert!(ranges_overlap(u64::MAX - 1, u64::MAX, u64::MAX - 1, 1));
     }
 
     #[test]
@@ -2617,6 +2881,16 @@ mod tests {
         }
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let used = &resource(image).host.used;
+            let before = used.swap(u64::MAX, Relaxed);
+            let inspected = host_made(image).unwrap();
+            let after = used.swap(before, Relaxed);
+            assert_eq!(after, u64::MAX);
+            assert_eq!(inspected.as_raw(), host_image.as_raw());
+        }
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
         // The upload list holds the texture until it is reset.
@@ -3406,5 +3680,21 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn video_room_stops_on_shared_spillover_or_low_physical_ram() {
+        let gib = 1 << 30;
+        let budget = 15 * gib;
+        // Normal headroom.
+        assert!(has_video_room([budget, 4 * gib, 16 * gib, 512 << 20], 10 * gib, 0, 90));
+        // Local + shared exceeds 90% of budget (9.5 + 4.8 >= 13.5 GiB).
+        assert!(!has_video_room([budget, 9500 << 20, 16 * gib, 4800 << 20], 8 * gib, 0, 90));
+        // Reserve for card copies reduces available headroom.
+        assert!(!has_video_room([budget, 12 * gib, 16 * gib, 512 << 20], 8 * gib, 2 * gib, 90));
+        // Windows 11 standby cache leaves ~1 GiB free physical RAM while healthy: still allowed.
+        assert!(has_video_room([budget, 4 * gib, 16 * gib, 512 << 20], 1 * gib, 0, 90));
+        // Critical low free physical PC RAM (< 256 MiB).
+        assert!(!has_video_room([budget, 4 * gib, 16 * gib, 512 << 20], 128 << 20, 0, 90));
     }
 }

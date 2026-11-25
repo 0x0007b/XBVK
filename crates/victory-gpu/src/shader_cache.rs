@@ -87,6 +87,12 @@ fn build_fingerprint(source_hash: &str, schema_version: u32, loop_limit: u32) ->
     h.update(source_hash.as_bytes());
     h.update(&[0]);
     h.update(&loop_limit.to_le_bytes());
+    // So is the widest host wave size and the view heap's null slot
+    // (they differ by host GPU): a translation cached without them must
+    // not be served.
+    crate::descriptor::host::probe_view_limit();
+    h.update(&victory_shader::emit::host_max_wave_set().to_le_bytes());
+    h.update(&victory_shader::emit::view_heap_limit().to_le_bytes());
     // Which group barriers wait is part of the translation too.
     h.update(&[victory_shader::emit::group_sync()]);
     // Wave64 / rounding switches that alter emitted DXIL.
@@ -94,7 +100,11 @@ fn build_fingerprint(source_hash: &str, schema_version: u32, loop_limit: u32) ->
         "VICTORY_WAVE_WIDE",
         "VICTORY_WAVE_DEEP_SKIPS",
         "VICTORY_WAVE_OWN_BITS",
+        "VICTORY_LDS_FLAGS",
         "VICTORY_F16_NEAREST",
+        "VICTORY_WAVE_LOCAL",
+        "VICTORY_STRICT_JOINS",
+        "VICTORY_MESH_OUTPUT_STRICT",
     ] {
         h.update(name.as_bytes());
         h.update(b"=");

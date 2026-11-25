@@ -917,8 +917,23 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard: a block guarded
+        // again between `kernel_will_write` and the read (the guard over all
+        // the views of a page protects other views from other threads) made
+        // the read fail with ERROR_INVALID_USER_BUFFER. Reading beside and
+        // copying in faults into the guard like the title's own writes.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        return into_destination(request, size, |out| {
+            if !bounce {
+                return read_into(request, out).map(|()| size);
+            }
+            let mut data = vec![0; size];
+            read_into(request, &mut data)?;
+            out.copy_from_slice(&data);
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1055,7 +1070,7 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
         xcl_core::lazy::ensure(request.destination as usize, len);
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
@@ -1073,13 +1088,37 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes());
+        // With the bytes in: the title's views of them changed without a
+        // fault of theirs (`victory_gpu`'s guard).
+        window.written();
+        return filled.map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    // A page the title has just made, or a view the host refuses for a moment (commit
+    // or address space short while a load maps many at once), can come right a little
+    // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
+    // about 1.5 s in all).
+    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let retries = *RETRIES.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+    });
+    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
+    let mut tries = 0;
+    while !written && tries < retries {
+        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+        tries += 1;
+        written = super::xmem::write_physical(pages, offset, &data[..n]);
+    }
+    if written {
+        if tries > 0 {
+            tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
+        }
         Ok(())
     } else {
+        let known = super::xmem::pages_known(pages, offset, len);
+        tracing::warn!(known, last_error = std::io::Error::last_os_error().raw_os_error(), "dstorage: retries used up");
         // Said aloud: Grand Theft Auto VI never reads a request's result
         // (it only polls for completion), so a destination left unwritten
         // is a model or texture that silently holds whatever its pages
