@@ -185,12 +185,24 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        let aniso_point_mip_supported = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool();
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
                 let [u, v, w] = d.address.map(|a| D3D12_TEXTURE_ADDRESS_MODE(a as i32));
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(d.filter as i32),
+                    Filter: D3D12_FILTER(d.filter_for_host(aniso_point_mip_supported) as i32),
                     AddressU: u,
                     AddressV: v,
                     AddressW: w,
@@ -982,6 +994,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An R32_FLOAT texture SRV (width, height, texels).
+    ScalarTexture(u32, u32, &'a [f32]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1090,20 +1104,16 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
-            let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // Texel words: 4 for RGBA32F, 1 for R32_UINT / R32_FLOAT.
+            let footprint_fmt =
+                |r: &ID3D12Resource, w: u32, h: u32, words: u32, format| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
-                                },
+                                Format: format,
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
@@ -1112,6 +1122,19 @@ impl Host {
                         },
                     },
                 };
+            let footprint_as = |r: &ID3D12Resource, w: u32, h: u32, words: u32| {
+                footprint_fmt(
+                    r,
+                    w,
+                    h,
+                    words,
+                    if words == 1 {
+                        DXGI_FORMAT_R32_UINT
+                    } else {
+                        DXGI_FORMAT_R32G32B32A32_FLOAT
+                    },
+                )
+            };
             let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
@@ -1157,6 +1180,46 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
+                    View::ScalarTexture(w, h, texels) => {
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R32_FLOAT),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 4).next_multiple_of(256);
+                        let upload = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for y in 0..h as usize {
+                            let row = &texels[y * w as usize..(y + 1) * w as usize];
+                            std::ptr::copy_nonoverlapping(
+                                row.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(y * pitch),
+                                row.len() * 4,
+                            );
+                        }
+                        upload.Unmap(0, None);
+                        list.CopyTextureRegion(
+                            &subresource(&tex),
+                            0,
+                            0,
+                            0,
+                            &footprint_fmt(&upload, w, h, 1, DXGI_FORMAT_R32_FLOAT),
+                            None,
+                        );
+                        keep.push(upload);
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, texels, faces) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1),

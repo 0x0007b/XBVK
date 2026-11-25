@@ -26,6 +26,16 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Where the [`SLOT_STRIDES`] buffer goes on, in dwords: two per heap slot,
+/// the low and then the high dword of the title address of the buffer view
+/// at that slot (0: none). For a program that takes a buffer view out of the
+/// heap at an index it computes and reads the address out of the descriptor
+/// to walk the memory behind it (the shadow-ray trace programs take their
+/// ray-tracing structure this way).
+pub const SLOT_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
+/// Dwords of the whole [`SLOT_STRIDES`] buffer: the strides, then the
+/// addresses ([`SLOT_ADDRESSES`]).
+pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -73,6 +83,7 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -112,16 +123,21 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
-/// The null slot a host view heap keeps at its end when the title's heap did not fit in it
-/// (0: no limit). Shaders translated while it is set read that slot for any view index at or
-/// past it: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
-/// larger) hung its GPU on reads past the end (GPU-based validation: "descriptor heap index
-/// out of bounds"), which AMD's driver forgives.
+/// The null slot every host view heap keeps at its end (0: no limit). Shaders translated while
+/// it is set read that slot for any view index at or past it. A read past a heap's end is
+/// undefined: a host that caps its heap (NVIDIA at 1 000 000 views; a retail game's heap is
+/// larger) hung its GPU (GPU-based validation: "descriptor heap index out of bounds"), and AMD
+/// RDNA3 took a page fault and removed the device.
 static VIEW_LIMIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// See [`VIEW_LIMIT`]: `null_slot` is the last slot of the host's view heap, kept null.
 pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
+pub fn view_heap_limit() -> u32 {
+    VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) struct Shader {
@@ -396,6 +412,25 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.heap_handle_inner(block, index, sampler, nonuniform, props, nonuniform)
+    }
+
+    /// A buffer `getDimensions` handle emitted with `nonUniformIndex = true`
+    /// to avoid an AMD DXIL compiler crash (`amdxc64.dll+0x861b9f`) without
+    /// counting toward `nonuniform_handles` when the index itself is uniform.
+    pub fn heap_handle_for_buffer_dim(&mut self, block: usize, index: V, props: (u32, u32)) -> V {
+        self.heap_handle_inner(block, index, false, true, props, false)
+    }
+
+    fn heap_handle_inner(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        count_nonuniform: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
@@ -424,7 +459,7 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
-        self.nonuniform_handles += u32::from(nonuniform);
+        self.nonuniform_handles += u32::from(count_nonuniform);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -448,8 +483,10 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
+                (flags::BARYCENTRICS, used.barycentrics || has_bary_input),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -460,7 +497,18 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+            let input_usage = self.m.input_usage(self.inputs.len());
+            for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
+                e.usage = mask;
+            }
         }
+        if self.pixel && std::env::var_os("VICTORY_FIX_HARMONIZE").is_none_or(|v| v != "0") {
+            harmonize_input_rows(&mut self.inputs);
+        }
+        // One interpolation mode per signature row, before the metadata
+        // and the container parts declare them.
+        super::container::unify_row_modes(&mut self.inputs, true);
+        super::container::unify_row_modes(&mut self.outputs, false);
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -772,6 +820,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::DOUBLES != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -877,5 +928,97 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Pixel inputs sharing a register row get one interpolation mode, as DXIL
+/// wants ("interpolation mode that differs from another element packed
+/// into the same row"). The console's compiler packs elements by register
+/// alone, since its shader code does the interpolation; here an element no
+/// code reads kept its default mode beside one read another way. Such an
+/// element takes the mode of the row's read elements (or, in a row nothing
+/// reads, constant when the row holds an integer). Rows whose reads
+/// themselves differ are made constant and interpolated by hand when
+/// lowered (`Lower::mixed_row`). `VICTORY_FIX_HARMONIZE=0` turns it off.
+pub(crate) fn harmonize_input_rows(inputs: &mut [SigElement]) {
+    let rows: std::collections::BTreeSet<u32> = inputs
+        .iter()
+        .filter(|e| e.kind == 0)
+        .filter_map(|e| e.row)
+        .collect();
+    for r in rows {
+        let of = |e: &SigElement| e.kind == 0 && e.row == Some(r);
+        let mut read: Vec<u8> = inputs
+            .iter()
+            .filter(|e| of(e) && e.usage != 0)
+            .map(|e| e.interp)
+            .collect();
+        read.sort_unstable();
+        read.dedup();
+        let mode = match read[..] {
+            [m] => m,
+            [] if inputs.iter().any(|e| of(e) && e.comp != 9) => 1,
+            _ => continue,
+        };
+        for e in inputs.iter_mut().filter(|e| of(e) && e.usage == 0) {
+            // An integer is never interpolated.
+            if e.comp == 9 || mode == 1 {
+                e.interp = mode;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::SigElement;
+    use super::harmonize_input_rows;
+
+    fn element(index: u32, row: u32, col: u8, comp: u8, interp: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn an_unread_element_takes_the_mode_of_the_read_one() {
+        // Row 3: a linear float read (2) beside an unread float left at constant (1).
+        let mut e = vec![element(0, 3, 0, 9, 2, 1), element(1, 3, 1, 9, 1, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!(e[1].interp, 2);
+    }
+
+    #[test]
+    fn an_unread_integer_is_never_made_interpolated() {
+        let mut e = vec![element(0, 3, 0, 9, 2, 1), element(1, 3, 1, 5, 1, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!(e[1].interp, 1);
+    }
+
+    #[test]
+    fn a_row_nothing_reads_is_constant_when_it_holds_an_integer() {
+        let mut e = vec![element(0, 4, 0, 9, 2, 0), element(1, 4, 1, 5, 1, 0)];
+        harmonize_input_rows(&mut e);
+        assert_eq!((e[0].interp, e[1].interp), (1, 1));
+    }
+
+    #[test]
+    fn rows_read_two_ways_are_left_to_the_lowering() {
+        let mut e = vec![
+            element(0, 5, 0, 9, 2, 1),
+            element(1, 5, 1, 9, 1, 1),
+            element(2, 5, 2, 9, 4, 0),
+        ];
+        harmonize_input_rows(&mut e);
+        assert_eq!(e[2].interp, 4);
     }
 }

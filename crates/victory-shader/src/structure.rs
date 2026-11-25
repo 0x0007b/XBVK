@@ -422,6 +422,9 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Lane masks not derived from EXEC or VALU results (constants, opaque
+    /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
+    pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -837,9 +840,11 @@ impl<'a> Lanes<'a> {
             }
         }
         self.masks.retain(|k, _| !split.contains(&k.0));
+        self.other.retain(|k, _| !split.contains(&k.0));
         self.active.retain(|lo| !split.contains(lo));
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
+            other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
                 .masks
                 .keys()
@@ -888,6 +893,36 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// The source pair of two adjacent dword moves in one block.
+    fn moved_pair(&self, k: Key) -> Option<Key> {
+        let moved = |v| {
+            let &(b, i) = self.defs.get(&v)?;
+            let inst = &self.p.blocks[b].insts[i];
+            if inst.name() != "s_mov_b32" {
+                return None;
+            }
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: dst, .. }),
+                src,
+                ..
+            } = &inst.fields
+            else {
+                return None;
+            };
+            let [Operand::Scalar { code: src, .. }] = src.as_slice() else {
+                return None;
+            };
+            if inst.write(Reg::S(*dst)) != Some(v) {
+                return None;
+            }
+            Some((b, *dst, *src, inst.read(Reg::S(*src))?))
+        };
+        let (lb, ld, ls, lv) = moved(k.0)?;
+        let (hb, hd, hs, hv) = moved(k.1)?;
+        (lb == hb && ld.checked_add(1) == Some(hd) && ls.checked_add(1) == Some(hs))
+            .then_some((lv, hv))
+    }
+
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -903,26 +938,37 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
-                let m = match (lo, hi) {
-                    (Some(at), Some(hi)) if at == hi => def(lo)
-                        .and_then(|i| self.sop(i))
-                        .and_then(|r| r.dst)
-                        .map(|d| d.1),
-                    _ => None,
-                };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {
                     def(d).is_some_and(|i| {
                         i.write(Reg::S(EXEC)) == Some(v) || i.write(Reg::S(EXEC + 1)) == Some(v)
                     })
                 };
-                let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
+                let (m, derived) = match (lo, hi) {
+                    (Some(at), Some(hi)) if at == hi => {
+                        let m = def(lo)
+                            .and_then(|i| self.sop(i))
+                            .and_then(|r| r.dst)
+                            .map(|d| d.1);
+                        (m, exec_write(lo, k.0) || exec_write(Some(hi), k.1))
+                    }
+                    _ => {
+                        let copied = self.moved_pair(k).and_then(|source| {
+                            let (m, derived) = self.mask(source);
+                            self.b
+                                .support(m)
+                                .iter()
+                                .all(|a| !matches!(a, Atom::Opaque(_)))
+                                .then_some((m, derived))
+                        });
+                        copied.map_or_else(
+                            || (None, exec_write(lo, k.0) || exec_write(hi, k.1)),
+                            |(m, derived)| (Some(m), derived),
+                        )
+                    }
+                };
                 // shortcut: the atom names the pair by its low dword, and
-                // lowering takes the high dword written beside it. For halves
-                // written apart (two `s_mov_b32`) lanes 32-63 are wrong unless
-                // lowering has no value for the low dword (EXEC, compares)
-                // and refuses. Give the atom both dwords when such code
-                // turns up.
+                // lowering takes the high dword written beside it.
                 let m = m.unwrap_or_else(|| {
                     let born = self.born(k.0);
                     self.b.atom(Atom::Opaque(k.0), born)

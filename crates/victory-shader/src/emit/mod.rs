@@ -86,6 +86,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
+#[cfg(all(test, windows))]
+mod image_lod_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -110,12 +112,12 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_max_wave, host_max_wave_set, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS,
+    SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -148,7 +150,10 @@ pub fn loop_limit() -> u32 {
 /// thread: the group stands until Windows resets the card. (The console's
 /// barrier is the wave's, whatever lanes are live, and a wave that ended
 /// is not waited for.) `VICTORY_GROUP_SYNC`:
-/// - unset or `2`: every barrier waits, as before.
+/// - unset or `auto`: on hosts narrower than the console wave, the title's
+///   divergent barriers retain their memory fences but do not wait. Other
+///   hosts and uniform barriers keep their group sync.
+/// - `2`: every barrier waits, as before.
 /// - `1`: the title's `s_barrier` waits only in a block every lane runs,
 ///   in a program no lane can be cut out of at the iteration limit.
 /// - `0`: no barrier waits, neither the title's nor the ones the
@@ -160,12 +165,26 @@ pub fn loop_limit() -> u32 {
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn group_sync() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_GROUP_SYNC.get() {
+        return mode;
+    }
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_SYNC").ok().as_deref().map(str::trim) {
+    *MODE.get_or_init(|| parse_group_sync(std::env::var("VICTORY_GROUP_SYNC").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GROUP_SYNC: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_group_sync(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
         Some("0") => 0,
         Some("1") => 1,
-        _ => 2,
-    })
+        Some("2") => 2,
+        _ => 3,
+    }
 }
 
 /// The clean-up passes that run over a translated program before it is
@@ -644,16 +663,15 @@ fn emit_program(
         static_samplers: l
             .samplers
             .iter()
-            .enumerate()
-            .map(|(n, &w)| {
+            .map(|&(w, cmp)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if cmp {
                     s.filter |= 0x80;
                 }
                 s
             })
             .collect(),
-        samplers: l.samplers,
+        samplers: l.samplers.iter().map(|&(w, _)| w).collect(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
@@ -759,6 +777,16 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn group_sync_defaults_to_auto_and_keeps_explicit_overrides() {
+        for value in [None, Some("auto"), Some(""), Some("invalid")] {
+            assert_eq!(super::parse_group_sync(value), 3);
+        }
+        for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
+            assert_eq!(super::parse_group_sync(Some(value)), mode);
+        }
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
@@ -967,6 +995,251 @@ mod tests {
         stores_v1(&[0x7E04_028B, 0xDACC_0000, 0x0100_0200]).unwrap();
     }
 
+    /// `ds_permute_b32` scatters through the console's zero-initialized
+    /// scratch: each lane gives its data register to the lane its address
+    /// names, within the calling lane's 32-lane half, and reads the slot of
+    /// its own name. It stopped as "an LDS operation".
+    #[test]
+    fn a_scatter_permute_writes_the_lane_its_address_names() {
+        // v_mov_b32 v2, 11; ds_permute_b32 v1, v0, v2
+        stores_v1(&[0x7E04_028B, 0xDAC8_0000, 0x0100_0200]).unwrap();
+    }
+
+    /// The scatter's barriers need every lane of the group: in a branch
+    /// this refuses (a wave-wide structuring of the block would open it).
+    #[test]
+    fn a_scatter_permute_in_a_branch_is_refused() {
+        let body = [
+            0x7E04_028B, // v_mov_b32 v2, 11
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE82_376A, // s_andn1_saveexec_b64 s[2:3], vcc
+            0xBF88_0002, // s_cbranch_execz 2
+            0xDAC8_0000, // ds_permute_b32 v1, v0, v2
+            0x0100_0200,
+            0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
+        ];
+        let e = stores_v1(&body).unwrap_err().to_string();
+        assert!(e.contains("a scatter permute in a branch"), "{e}");
+    }
+
+    /// The same backward permute on a host of 32-lane waves (the checkerboard shadow
+    /// masks), where the lane named may be in the other host wave: the two
+    /// exchange their 64 lanes' dwords through a table past the program's LDS
+    /// ([`lower::Lower::bpermute_halves`]). It stopped as "a lane permute
+    /// across two host waves".
+    #[test]
+    fn a_backward_permute_across_two_host_waves_lowers_through_the_table() {
+        // v1 = s0 + v0; v2 = v0 << 2; ds_bpermute_b32 v1, v2, v1 offset 128
+        // (32 lanes on, so both halves read across)
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let r = stores_v1(&[0x4A02_0000, 0x3404_0082, 0xDACC_0080, 0x0100_0102]);
+        lower::TEST_HOST_WAVE.set(was);
+        r.unwrap();
+    }
+
+    /// The same permute where only the lanes below s0 run it: refused per lane
+    /// (the table needs every lane's dword), the branch it sits in named; with
+    /// that branch taken wave-wide, it lowers.
+    #[test]
+    fn a_backward_permute_across_two_host_waves_needs_its_branch_wave_wide() {
+        // v_cmp_gt_u32 vcc, s0, v0; s_and_saveexec_b64 s[12:13], vcc;
+        // s_cbranch_execz over the body, to the restore of EXEC;
+        // v1 = s0 + v0; v2 = v0 << 2; ds_bpermute_b32 v1, v2, v1 offset 128;
+        // s_mov_b64 exec, s[12:13]
+        let body: [u32; 8] = [
+            0x7D88_0000, 0xBE8C_246A, 0xBF88_0004, 0x4A02_0000, 0x3404_0082, 0xDACC_0080,
+            0x0100_0102, 0xBEFE_040C,
+        ];
+        // (the same program as `stores_v1`, kept whole for the two structures)
+        use crate::native::{HwStage, NativeProgram, RootParam, ResourceType, RootType, UsedResource};
+        let mut words = vec![0xBE81_0380, 0xF408_0200, 0xFA00_0000];
+        words.extend_from_slice(&body);
+        words.extend_from_slice(&[0x3406_0082, 0xE070_1000, 0x8002_0103, 0xBF81_0000]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let branch = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .expect("the branch");
+        lower::take_needs();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let per_lane = {
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+        };
+        assert!(matches!(
+            &per_lane,
+            Err(crate::ShaderError::Unsupported { what, .. })
+                if *what == "a lane permute across two host waves where not every lane runs"
+        ));
+        let st = structure::structure(&p).unwrap();
+        assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![branch]));
+        // wave-wide: every lane runs the permute (EXEC stays a guard on it)
+        let st = structure::structure_wide(&p, &std::collections::HashSet::from([branch])).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        lowered.unwrap();
+    }
+
+    /// The forward permute (`ds_permute_b32`) on a host of 32-lane waves:
+    /// each lane's dword goes to the lane its address names, through the same
+    /// table as the backward permute's, and every lane takes what was written
+    /// to its own slot. It stopped as "an LDS operation".
+    #[test]
+    fn a_forward_permute_across_two_host_waves_lowers_through_the_table() {
+        // v1 = s0 + v0; v2 = v0 << 2 (the lane's byte address);
+        // ds_permute_b32 v1, v2, v1 offset 128 (32 lanes on, so both halves
+        // write across)
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let r = stores_v1(&[0x4A02_0000, 0x3404_0082, 0xDAC8_0080, 0x0100_0102]);
+        lower::TEST_HOST_WAVE.set(was);
+        r.unwrap();
+    }
+
+    /// The forward permute where only the lanes below s0 run it: refused per
+    /// lane (the barriers need every lane), the branch it sits in named; with
+    /// that branch taken wave-wide, it lowers.
+    #[test]
+    fn a_forward_permute_across_two_host_waves_needs_its_branch_wave_wide() {
+        // v_cmp_gt_u32 vcc, s0, v0; s_and_saveexec_b64 s[12:13], vcc;
+        // s_cbranch_execz over the body, to the restore of EXEC;
+        // v1 = s0 + v0; v2 = v0 << 2; ds_permute_b32 v1, v2, v1 offset 128;
+        // s_mov_b64 exec, s[12:13]
+        let body: [u32; 8] = [
+            0x7D88_0000, 0xBE8C_246A, 0xBF88_0004, 0x4A02_0000, 0x3404_0082, 0xDAC8_0080,
+            0x0100_0102, 0xBEFE_040C,
+        ];
+        // (the same program as `stores_v1`, kept whole for the two structures)
+        use crate::native::{HwStage, NativeProgram, RootParam, ResourceType, RootType, UsedResource};
+        let mut words = vec![0xBE81_0380, 0xF408_0200, 0xFA00_0000];
+        words.extend_from_slice(&body);
+        words.extend_from_slice(&[0x3406_0082, 0xE070_1000, 0x8002_0103, 0xBF81_0000]);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let branch = (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .expect("the branch");
+        lower::take_needs();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let per_lane = {
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+        };
+        assert!(matches!(
+            &per_lane,
+            Err(crate::ShaderError::Unsupported { what, .. })
+                if *what == "a lane permute across two host waves where not every lane runs"
+        ));
+        let st = structure::structure(&p).unwrap();
+        assert_eq!(lower::branches_around(&st, &lower::take_needs()), Some(vec![branch]));
+        // wave-wide: every lane runs the permute (EXEC stays a guard on it)
+        let st = structure::structure_wide(&p, &std::collections::HashSet::from([branch])).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_WAVE.set(was);
+        lowered.unwrap();
+    }
+
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
@@ -984,6 +1257,47 @@ mod tests {
         ];
         let e = stores_v1(&body).unwrap_err().to_string();
         assert!(e.contains("a carry-in from an untracked mask"), "{e}");
+    }
+
+    /// A wave64 compute program reading SCC of a mask operation (`scc_some`)
+    /// inside a divergent per-lane branch on a 32-lane host: exchanging the
+    /// two halves' answers needs every lane there, so `emit` falls back to
+    /// `with_local_waves_any` and takes each host wave's `WaveAnyTrue`.
+    #[test]
+    fn scc_some_in_a_divergent_branch_lowers_per_host_wave_on_wave32() {
+        // Direct read (`s_and_b64` -> `s_cselect_b32`) and scalar-skip phi join
+        // inside a per-lane divergent branch (`s_and_saveexec_b64`).
+        let direct = [
+            0x7E02_0287, // v_mov_b32 v1, 7
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBF88_0004, // s_cbranch_execz 4
+            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+            0x8784_6A7E, // s_and_b64 s[4:5], exec, vcc (sets SCC in scc_some)
+            0x8506_8789, // s_cselect_b32 s6, 9, 7
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ];
+        let joined = [
+            0x7E02_0287, // v_mov_b32 v1, 7
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+            0xBF88_0006, // s_cbranch_execz 6
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF84_0002, // s_cbranch_scc0 2 (uniform skip, SCC = 0)
+            0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+            0x8784_6A7E, // s_and_b64 s[4:5], exec, vcc (sets SCC in scc_some)
+            0x8506_8789, // s_cselect_b32 s6, 9, 7 (reads joined SCC phi)
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        ];
+        for body in [&direct[..], &joined[..]] {
+            stores_v1(body).unwrap();
+            lower::TEST_HOST_WAVE.set(Some(32));
+            let res = stores_v1(body);
+            lower::TEST_HOST_WAVE.set(None);
+            res.unwrap();
+        }
     }
 
     /// A pixel shader writing a constant colour.
@@ -1295,7 +1609,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [7, 1, 1],
+                threads: [15, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -1323,21 +1637,53 @@ mod tests {
             v.validate(&mut dxil).unwrap();
         }
         #[cfg(windows)]
-        if let Ok(host) = super::host::Host::new(false) {
+        for warp in [false, true] {
+            let Ok(host) = super::host::Host::new(warp) else {
+                continue;
+            };
             let cs = super::HostShader {
                 stage: super::HwStage::Cs,
-                dxil,
-                user_data: l.user_data,
+                dxil: dxil.clone(),
+                user_data: l.user_data.clone(),
                 samplers: Vec::new(),
                 static_samplers: Vec::new(),
-                root_cbvs: l.root_cbvs,
-                root_srvs: l.root_srvs,
-                root_uavs: l.root_uavs,
+                root_cbvs: l.root_cbvs.clone(),
+                root_srvs: l.root_srvs.clone(),
+                root_uavs: l.root_uavs.clone(),
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
+                7.0f32,
+                3.0,
+                -1.0,
+                1e-40,
+                1.0,
+                1e35,
+                1e-35,
+                1e-36,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                -1e35,
+                1e35,
+                0.0,
+                1.0,
+                -0.0,
+                1.0,
+                0.0,
+                -2.0,
+                1.0,
+                f32::INFINITY,
+                -1.0,
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::INFINITY,
+                1e38,
+                1e-38,
+                -1e38,
+                1e-38,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -1360,29 +1706,37 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
-            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
-            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
+            let got: Vec<f32> = out[0][..15].iter().copied().map(f32::from_bits).collect();
+            assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "warp={warp} got {:?}", got);
+            assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits(), "warp={warp}");
             assert!(
                 (got[2] - 1e-35).abs() <= 1e-40,
-                "lane 2 got {:?} ({:#x})",
+                "warp={warp} lane 2 got {:?} ({:#x})",
                 got[2],
                 out[0][2]
             );
             assert!(
                 (got[3] - 10.0).abs() < 1e-5,
-                "lane 3 got {:?} ({:#x})",
+                "warp={warp} lane 3 got {:?} ({:#x})",
                 got[3],
                 out[0][3]
             );
-            assert_eq!(out[0][4], 0xFFC0_0000);
-            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert_eq!(out[0][4], 0xFFC0_0000, "warp={warp} 0/0");
+            assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits(), "warp={warp} -1/0");
             assert!(
                 (got[6] - (-1.0)).abs() < 1e-6,
-                "lane 6 got {:?} ({:#x})",
+                "warp={warp} lane 6 got {:?} ({:#x})",
                 got[6],
                 out[0][6]
             );
+            assert_eq!(out[0][7], 0.0f32.to_bits(), "warp={warp} +0/1");
+            assert_eq!(out[0][8], (-0.0f32).to_bits(), "warp={warp} -0/1");
+            assert_eq!(out[0][9], (-0.0f32).to_bits(), "warp={warp} +0/-2");
+            assert_eq!(out[0][10], 0.0f32.to_bits(), "warp={warp} 1/+Inf");
+            assert_eq!(out[0][11], (-0.0f32).to_bits(), "warp={warp} -1/+Inf");
+            assert_eq!(out[0][12], 0xFFC0_0000, "warp={warp} +Inf/+Inf");
+            assert_eq!(out[0][13], f32::INFINITY.to_bits(), "warp={warp} 1e38/1e-38");
+            assert_eq!(out[0][14], f32::NEG_INFINITY.to_bits(), "warp={warp} -1e38/1e-38");
         }
     }
 }
@@ -1739,5 +2093,145 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// A dead interpolated channel removed by `bitcode::opt` must not remain
+    /// marked read in `ISG1` (the DXIL validator checks the input signature
+    /// against the surviving `loadInput` / `attributeAtVertex` calls).
+    #[test]
+    fn dead_input_read_is_cleared_from_isg1_after_opt() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC810_0100, // v_interp_p1_f32 v4, v0, attr0.y (dead)
+            0xC811_0101, // v_interp_p2_f32 v4, v1, attr0.y (dead)
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let host = Container::parse(&shader.dxil).unwrap();
+        let isg1 = host.part(FourCC::ISG1).unwrap().data;
+        // Row 0's ReadWriteMask byte is at offset 8 (header) + 25.
+        assert_eq!(isg1[8 + 25], 0x1, "dead .y channel left in ISG1 rw mask");
+        validate(&shader);
+    }
+
+    #[cfg(windows)]
+    fn dump_dxil(container: &[u8]) -> Option<String> {
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => validator::Validator::default_path()?.with_file_name("dxc.exe"),
+        };
+        if !dxc.exists() {
+            return None;
+        }
+        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        std::fs::write(&file, container).ok()?;
+        let out = std::process::Command::new(dxc)
+            .arg("-dumpbin")
+            .arg(&file)
+            .output()
+            .ok()?;
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            out.status.success(),
+            "dxc -dumpbin failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpolated_f16_writes_the_op_sel_half_with_modifiers() {
+        // p1_f32 v2, v0, attr0.x; then a p2_f16 completing it into v2.
+        let p2 = |dst_high: bool, omod: u32, clamp: bool| {
+            let vgpr = |n: u32| 256 + n;
+            let mut w0 = 0x35u32 << 26 | 0x35au32 << 16 | 2;
+            if dst_high {
+                w0 |= 1 << 14; // op_sel[3]: the high destination half.
+            }
+            if clamp {
+                w0 |= 1 << 15;
+            }
+            let w1 = vgpr(1) << 9 | vgpr(3) << 18;
+            [w0, w1 | omod << 27]
+        };
+        let dump = |dst_high: bool, omod: u32, clamp: bool| {
+            let [w0, w1] = p2(dst_high, omod, clamp);
+            let words = [
+                v_add_f32(2, 0, 1), // non-constant prior value in v2 so opt keeps the preserved half
+                0xC80C_0000u32,     // v_interp_p1_f32 v3, v0, attr0.x
+                w0,
+                w1, // v_interp_p2_f16 v2, attr0, v1, v3
+                0xF800_180F,
+                0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![PsInput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: true,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr: 2,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = |name: &str, kind, usage, half| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage,
+                half,
+            };
+            let isg1 = container::signature(&[el("TEXCOORD", 0, 0, true)], true);
+            let osg1 = container::signature(&[el("SV_Target", 16, 15, false)], false);
+            let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
+        };
+        let (Some(low), Some(high)) = (
+            dump_dxil(&dump(false, 0, false)),
+            dump_dxil(&dump(true, 1, true)),
+        ) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        // The low-half write keeps the destination's high half.
+        assert!(low.contains("-65536"), "low write keeps the high half");
+        // The high-half write shifts the result up by 16.
+        assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
+        // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
+        assert!(high.contains("2.000000e+00"), "omod multiplies by two");
+        assert!(
+            high.contains("dx.op.unary.f32(i32 7"),
+            "clamp saturates the result"
+        );
+        assert!(!low.contains("dx.op.unary.f32(i32 7"));
     }
 }

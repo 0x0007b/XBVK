@@ -24,6 +24,49 @@ pub(crate) struct SigElement {
     pub half: bool,
 }
 
+/// Gives the elements sharing a signature row one interpolation mode, as
+/// DXIL requires ("interpolation mode that differs from another element
+/// packed into the same row"). The console packed rows whose elements the
+/// source declared alike; here each element's mode is chosen on its own
+/// (by type, or by how the program reads it), so an unread element can
+/// keep a default its row-mates do not share. The mode of the elements
+/// that are used wins when they agree; with none used, or on the output
+/// side when they disagree, a constant member makes the row constant (a
+/// float may be declared constant; an integer may not be interpolated).
+/// Rows whose used inputs disagree are left for the validator to name.
+pub(crate) fn unify_row_modes(elements: &mut [SigElement], inputs: bool) {
+    let rows: std::collections::BTreeSet<u32> = elements
+        .iter()
+        .filter(|e| e.interp != 0)
+        .filter_map(|e| e.row)
+        .collect();
+    for row in rows {
+        let members = |e: &SigElement| e.interp != 0 && e.row == Some(row);
+        let mut modes = elements.iter().filter(|e| members(e)).map(|e| e.interp);
+        let first = modes.next().unwrap_or(0);
+        if modes.all(|m| m == first) {
+            continue;
+        }
+        let used: std::collections::BTreeSet<u8> = elements
+            .iter()
+            .filter(|e| members(e) && e.usage != 0)
+            .map(|e| e.interp)
+            .collect();
+        let constant = elements.iter().any(|e| members(e) && e.interp == 1);
+        let target = match used.len() {
+            1 => used.first().copied(),
+            0 if constant => Some(1),
+            0 => None,
+            _ if !inputs && constant => Some(1),
+            _ => None,
+        };
+        let Some(target) = target else { continue };
+        for e in elements.iter_mut().filter(|e| members(e)) {
+            e.interp = target;
+        }
+    }
+}
+
 impl SigElement {
     fn system_value(&self) -> u32 {
         match self.kind {
@@ -90,7 +133,8 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    // Packed elements in the same register retain module signature order.
+    order.sort_by_key(|&i| elements[i].row.is_none());
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -369,21 +413,40 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    let x: Vec<u32> = block
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
+    const K: [u32; 64] = [
+        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
+        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
+        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
+        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
+        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
+        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
+        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
+        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
+        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
+        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
+        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
+        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
+        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
+        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
+        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
+        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
+    ];
+    let x: [u32; 16] = std::array::from_fn(|i| {
+        u32::from_le_bytes([
+            block[4 * i],
+            block[4 * i + 1],
+            block[4 * i + 2],
+            block[4 * i + 3],
+        ])
+    });
     let [mut a, mut b, mut c, mut d] = *state;
-    for i in 0..64 {
+    for (i, &k) in K.iter().enumerate() {
         let (f, g) = match i / 16 {
             0 => ((b & c) | (!b & d), i),
             1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
             2 => (b ^ c ^ d, (3 * i + 5) % 16),
             _ => (c ^ (b | !d), (7 * i) % 16),
         };
-        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
         let rotated = a
             .wrapping_add(f)
             .wrapping_add(k)
@@ -399,6 +462,83 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn element(
+        name: &str,
+        index: u32,
+        kind: u8,
+        interp: u8,
+        row: u32,
+        col: u8,
+        cols: u8,
+        usage: u8,
+    ) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: if kind == 13 { 5 } else { 9 },
+            interp,
+            row: Some(row),
+            col,
+            cols,
+            usage,
+            half: false,
+        }
+    }
+
+    /// PS_PropFoliageDeferred_Fire_ExportDepth (999de9c4262184ce): an
+    /// unread TEXCOORD9 shares row 9 with the constant front face.
+    #[test]
+    fn an_unread_element_takes_its_row_mates_mode() {
+        let mut sig = vec![
+            element("TEXCOORD", 0, 0, 2, 1, 0, 4, 0xf),
+            element("TEXCOORD", 9, 0, 2, 9, 0, 1, 0),
+            element("SV_IsFrontFace", 0, 13, 1, 9, 1, 1, 1),
+        ];
+        unify_row_modes(&mut sig, true);
+        assert_eq!(sig.iter().map(|e| e.interp).collect::<Vec<_>>(), [2, 1, 1]);
+    }
+
+    #[test]
+    fn read_inputs_that_disagree_keep_their_modes() {
+        let mut sig = vec![
+            element("TEXCOORD", 0, 0, 2, 3, 0, 3, 0b111),
+            element("TEXCOORD", 1, 0, 1, 3, 3, 1, 1),
+        ];
+        unify_row_modes(&mut sig, true);
+        assert_eq!(sig.iter().map(|e| e.interp).collect::<Vec<_>>(), [2, 1]);
+    }
+
+    #[test]
+    fn an_output_row_with_a_constant_member_is_constant() {
+        // VS outputs: COLOR0 (uint, constant) and TEXCOORD22 (float) in row 14.
+        let mut sig = vec![
+            element("COLOR", 0, 0, 1, 14, 0, 1, 1),
+            element("TEXCOORD", 22, 0, 2, 14, 1, 2, 0b11),
+        ];
+        unify_row_modes(&mut sig, false);
+        assert_eq!(sig.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1]);
+    }
+
+    /// PS_MirrorReflectionDeferredPedTexturedNC (7e80c1635201799c) lists
+    /// TEXCOORD16 (row 10, w) before TANGENT0 (row 10, xyz); the part keeps
+    /// that order, as the validator's own serialisation does.
+    #[test]
+    fn signature_rows_keep_element_order() {
+        let sig = vec![
+            element("TEXCOORD", 16, 0, 2, 10, 3, 1, 1),
+            element("TANGENT", 0, 0, 2, 10, 0, 3, 0b111),
+        ];
+        let part = signature(&sig, true);
+        let row = |i: usize| u32::from_le_bytes(part[8 + 32 * i + 8..][..4].try_into().unwrap());
+        assert_eq!(
+            (row(0), row(1)),
+            (16, 0),
+            "semantic indices in element order"
+        );
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

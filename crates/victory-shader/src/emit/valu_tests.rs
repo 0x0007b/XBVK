@@ -175,7 +175,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
-        samplers: lowered.samplers,
+        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
@@ -259,6 +259,39 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
+#[test]
+fn scalar_quad_masks_pack_nibbles_and_set_scc() {
+    let pack_words = |opcode: u32| {
+        [
+            0xBE90_0000 | opcode << 8, // s_quadmask s16, s0 (pairs for b64)
+            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
+            sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
+            sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
+            vop1(1, 0, sgpr(16)),      // v_mov_b32 v0, s16
+        ]
+    };
+    let cases = [
+        ([0, 0, 0, 0], [0, 0]),
+        ([0x8000_0420, 0x0100_0001, 0, 0], [0x1_0086, 0x1_4186]),
+        ([0, 0x8000_0000, 0, 0], [0, 0x1_8000]),
+        ([u32::MAX, u32::MAX, 0, 0], [0x1_00ff, 0x1_ffff]),
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    for (wide, opcode) in [0x2c, 0x2d].into_iter().enumerate() {
+        let shader = build_valu_cs(&pack_words(opcode));
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            assert_eq!(got, cases[i].1[wide], "{backend}, opcode {opcode:#x}");
+        });
+    }
+    let high = build_valu_cs(&[
+        0xBE90_2D00, // s_quadmask_b64 s[16:17], s[0:1]
+        vop1(1, 0, sgpr(17)),
+    ]);
+    run_cases(&high, &inputs, |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: high dword");
+    });
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -305,6 +338,110 @@ fn packed_add_selects_halves_of_inline_constants() {
         run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
             assert_eq!(got, expected, "{backend}: {words:08x?}");
         });
+    }
+}
+
+/// The float `v_cvt_f32_f64` gives for `x`: Rust's rounding (to nearest
+/// even), with results below the smallest normal float flushed to signed
+/// zero as the console's default float mode does.
+fn cvt_f32_f64_reference(x: f64) -> u32 {
+    let r = x as f32;
+    if r.is_subnormal() || (r == 0.0 && x != 0.0) {
+        r.to_bits() & 0x8000_0000
+    } else {
+        r.to_bits()
+    }
+}
+
+#[test]
+#[ignore = "expects results below the smallest normal float flushed to zero; the IEEE lowering (v_cvt_f32_f64_matches_ieee754) is kept until the console's mode is checked"]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x0f)
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let tie_even = 1.0f64 + f64::from(f32::EPSILON) / 2.0; // ties to 1.0
+    let tie_odd = 1.0f64 + 1.5 * f64::from(f32::EPSILON); // ties up to 1 + 2 ulp
+    let values = [
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        std::f64::consts::PI,
+        1.0e-3,
+        123_456_789.123,
+        tie_even,
+        tie_odd,
+        1.0 + f64::from(f32::EPSILON) * 0.75,
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * 1.000_000_1, // rounds to infinity
+        1.0e300,
+        -1.0e300,
+        1.0e-40, // a float denormal: flushed
+        -1.0e-300,
+        f64::from(f32::MIN_POSITIVE),
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .map(|x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let x = values[i];
+        if x.is_nan() {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: cvt({x}) = {got:#010x}, want NaN");
+            return;
+        }
+        let want = cvt_f32_f64_reference(x);
+        assert_eq!(got, want, "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}");
+    });
+}
+
+/// The lane `v_permlane16_b32` (`cross` false) or `v_permlanex16_b32` reads
+/// for `lane`, with selector dwords `s1` (lanes 0-7 of a row) and `s2`.
+fn permlane_source(lane: u32, s1: u32, s2: u32, cross: bool) -> u32 {
+    let sel = u64::from(s1) | u64::from(s2) << 32;
+    let pick = (sel >> (4 * (lane & 15)) & 15) as u32;
+    let row = if cross {
+        (lane & !31) | ((lane & 16) ^ 16)
+    } else {
+        lane & !15
+    };
+    row | pick
+}
+
+#[test]
+fn v_permlane16_and_x16_read_the_lanes_their_selectors_pick() {
+    // 32 lanes, each with its lane number in v0; v1 = permute(v0, s0, s1);
+    // lane `read` of v1 into s12, then into v0 for the store.
+    let selectors: [(u32, u32); 3] = [
+        (0x7654_3210, 0xfedc_ba98), // identity within the row
+        (0x89ab_cdef, 0x0123_4567), // reversed
+        (0x1111_1111, 0xf0f0_f0f0), // repeats
+    ];
+    for (op, cross) in [(0x377u16, false), (0x378, true)] {
+        for read in [0u8, 5, 15, 16, 22, 31] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&vop3(op, 1, vgpr(0), sgpr(0), sgpr(1)));
+            // v_readlane_b32 s12, v1, read (inline constant 128 + read)
+            body.extend_from_slice(&vop3(0x360, 12, vgpr(1), 128 + u16::from(read), 0));
+            body.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
+            let shader = build_cs(&body, 32, 0);
+            let inputs: Vec<[u32; 4]> = selectors.iter().map(|&(a, b)| [a, b, 0, 0]).collect();
+            // Cross-lane code declares WaveSize(32), which WARP's pipeline
+            // creation refuses: hardware only.
+            run_cases_on(&shader, &inputs, &[("hardware", false)], |backend, i, inp, got| {
+                let want = permlane_source(u32::from(read), inp[0], inp[1], cross);
+                assert_eq!(
+                    got, want,
+                    "{backend}: op {op:#x} selectors {:08x?}, lane {read}",
+                    selectors[i]
+                );
+            });
+        }
     }
 }
 
@@ -473,6 +610,31 @@ fn v_cmp_lg_is_false_for_nan() {
             );
         });
     }
+}
+
+#[test]
+fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
+    // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
+    let shader = build_valu_cs(&[vop1(0x00e, 0, vgpr(1))]);
+    let nibble = |n: u32| (((n as i32) << 28) >> 28) as f32 / 16.0;
+
+    let mut cases: Vec<u32> = (0..16).collect();
+    // Bits above the low nibble are ignored.
+    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = nibble(cases[i]).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
+            inp[0],
+            f32::from_bits(got),
+        );
+    });
+    // Spot-check the reference itself: 0x5 -> 0.3125, 0x8 -> -0.5, 0xF -> -0.0625.
+    assert_eq!(nibble(0xABCD_EF05), 0.3125);
+    assert_eq!(nibble(8), -0.5);
+    assert_eq!(nibble(0xF), -0.0625);
 }
 
 #[test]
@@ -1263,4 +1425,508 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// SMEM `s_load_dwordx4` or `s_load_dwordx8` with a constant byte offset.
+const fn s_load_dwords(op: u32, dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (op & 0xFF) << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | (byte_off & 0x1F_FFFF),
+    ]
+}
+
+/// MIMG sequential-address instruction (`dim`: 1 = 2D).
+const fn mimg_sample(
+    op: u16,
+    dmask: u8,
+    dim: u8,
+    vdata: u8,
+    vaddr: u8,
+    srsrc: u8,
+    ssamp: u8,
+) -> [u32; 2] {
+    [
+        0x3C << 26
+            | ((op as u32 & 0x7F) << 18)
+            | ((dmask as u32 & 0xF) << 8)
+            | ((dim as u32 & 7) << 3)
+            | ((op as u32 >> 7) & 1),
+        ((ssamp as u32 >> 2) & 0x1F) << 21
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+/// Builds a 1-thread compute shader with 4 root constants (`s0..s3` copied
+/// into `v1..v4`), Texture2D SRV at `s[16:23]` (view table index 0), Raw UAV
+/// at `s[24:27]` (view table index 1), and sampler at `s[12:15]` (sampler
+/// table index 0). `body` writes 4 result dwords into `v8..v11`.
+fn build_sample_cs(body: &[u32]) -> HostShader {
+    let mut words = Vec::new();
+    words.push(s_mov_b32(5, 0x80));
+    words.push(s_mov_b32(7, 0x80));
+    words.extend_from_slice(&s_load_dwords(0x03, 16, 4, 0));
+    words.extend_from_slice(&s_load_dwords(0x02, 24, 4, 32));
+    words.extend_from_slice(&s_load_dwords(0x02, 12, 6, 0));
+    words.push(vop1(0x001, 0, 0x80));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    words.extend_from_slice(body);
+    for k in 0..4u8 {
+        words.extend_from_slice(&buffer_store_dword(8 + k, 24, u16::from(k) * 4));
+    }
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 6,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+fn run_sample_cases(
+    shader: &HostShader,
+    texels: &[[f32; 4]],
+    sampler: windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC,
+    cases: &[([u32; 4], [f32; 4])],
+) {
+    run_sample_view_cases(shader, || View::Texture(4, 4, texels), sampler, cases);
+}
+
+fn run_scalar_sample_cases(
+    shader: &HostShader,
+    texels: &[f32],
+    sampler: windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC,
+    cases: &[([u32; 4], [f32; 4])],
+) {
+    run_sample_view_cases(shader, || View::ScalarTexture(4, 4, texels), sampler, cases);
+}
+
+fn run_sample_view_cases<'a>(
+    shader: &HostShader,
+    texture_view: impl Fn() -> View<'a>,
+    sampler: windows::Win32::Graphics::Direct3D12::D3D12_SAMPLER_DESC,
+    cases: &[([u32; 4], [f32; 4])],
+) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &(inputs, want)) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs[u.dword as usize],
+                    (RootType::Table, 1 | 2) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[texture_view(), View::RawUav(4)],
+                        samplers: &[sampler],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            let got = [
+                f32::from_bits(out[0][0]),
+                f32::from_bits(out[0][1]),
+                f32::from_bits(out[0][2]),
+                f32::from_bits(out[0][3]),
+            ];
+            assert_eq!(got, want, "{label}: case {i} got {got:?}, want {want:?}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn image_gather4_c_lz_and_offset_match_d3d12() {
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let mut scalar_texels = [0.0f32; 16];
+    for y in 0..4usize {
+        for x in 0..4usize {
+            scalar_texels[y * 4 + x] = (y * 4 + x) as f32;
+        }
+    }
+    let cmp_sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let f = f32::to_bits;
+
+    // image_gather4_c_lz (0x04f): v1 = reference, v2 = u, v3 = v.
+    let gather_r = build_sample_cs(&mimg_sample(0x04f, 0x1, 1, 8, 1, 16, 12));
+    run_scalar_sample_cases(
+        &gather_r,
+        &scalar_texels,
+        cmp_sampler,
+        &[
+            ([f(3.5), f(0.25), f(0.25), 0], [1.0, 1.0, 0.0, 0.0]),
+            ([f(4.5), f(0.25), f(0.25), 0], [0.0, 1.0, 0.0, 0.0]),
+        ],
+    );
+
+    // Non-red channel gather-cmp (dmask:0x2 -> channel 1): validate DXIL and
+    // pipeline creation (WARP compares channel 0 on RGBA32F for GatherCmp).
+    let gather_g = build_sample_cs(&mimg_sample(0x04f, 0x2, 1, 8, 1, 16, 12));
+    {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let host = Host::new(true).expect("WARP host");
+        host.compute_pipeline(&gather_g)
+            .expect("compute_pipeline for green gather4_c_lz");
+    }
+
+    // image_gather4_c_lz_o (0x05f): v1 = dynamic offset, v2 = ref, v3 = u, v4 = v.
+    let gather_o = build_sample_cs(&mimg_sample(0x05f, 0x1, 1, 8, 1, 16, 12));
+    run_scalar_sample_cases(
+        &gather_o,
+        &scalar_texels,
+        cmp_sampler,
+        &[
+            ([0x0000_0102, f(8.5), f(0.25), f(0.25)], [1.0, 1.0, 0.0, 0.0]),
+            ([0x0000_3F3F, f(9.5), f(0.75), f(0.75)], [0.0, 1.0, 0.0, 0.0]),
+        ],
+    );
+}
+
+#[test]
+fn image_sample_offset_variants_match_d3d12() {
+    use super::container::SigElement;
+    use super::host::stub_vs;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    let mut texels = [[0.0f32; 4]; 16];
+    let mut scalar_texels = [0.0f32; 16];
+    for y in 0..4usize {
+        for x in 0..4usize {
+            let v = (y * 4 + x) as f32;
+            texels[y * 4 + x] = [v, 100.0 + v, 200.0 + v, 300.0 + v];
+            scalar_texels[y * 4 + x] = v;
+        }
+    }
+    let point_sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let cmp_sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS,
+        ..point_sampler
+    };
+    let f = f32::to_bits;
+
+    // image_sample_l_o (0x034): v5 = imm offset (-1, +2), v6 = u, v7 = v, v8 = lod; dmask = 0x3.
+    let sample_l_o = build_sample_cs(&[
+        vop1(0x001, 5, 0xFF),
+        0x0000_023F,
+        vop1(0x001, 6, vgpr(1)),
+        vop1(0x001, 7, vgpr(2)),
+        vop1(0x001, 8, vgpr(3)),
+        vop1(0x001, 10, 0x80),
+        vop1(0x001, 11, 0x80),
+        mimg_sample(0x034, 0x3, 1, 8, 5, 16, 12)[0],
+        mimg_sample(0x034, 0x3, 1, 8, 5, 16, 12)[1],
+    ]);
+    run_sample_cases(
+        &sample_l_o,
+        &texels,
+        point_sampler,
+        &[([f(0.375), f(0.125), f(0.0), 0], [8.0, 108.0, 0.0, 0.0])],
+    );
+
+    // image_sample_c_lz_o (0x03f): v5 = imm offset (+1, +2), v6 = ref, v7 = u, v8 = v; dmask = 0x1.
+    let sample_c_lz_o = build_sample_cs(&[
+        vop1(0x001, 5, 0xFF),
+        0x0000_0201,
+        vop1(0x001, 6, vgpr(1)),
+        vop1(0x001, 7, vgpr(2)),
+        vop1(0x001, 8, vgpr(3)),
+        vop1(0x001, 9, 0x80),
+        vop1(0x001, 10, 0x80),
+        vop1(0x001, 11, 0x80),
+        mimg_sample(0x03f, 0x1, 1, 8, 5, 16, 12)[0],
+        mimg_sample(0x03f, 0x1, 1, 8, 5, 16, 12)[1],
+    ]);
+    run_scalar_sample_cases(
+        &sample_c_lz_o,
+        &scalar_texels,
+        cmp_sampler,
+        &[
+            ([f(8.5), f(0.125), f(0.125), 0], [1.0, 0.0, 0.0, 0.0]),
+            ([f(9.5), f(0.125), f(0.125), 0], [0.0, 0.0, 0.0, 0.0]),
+        ],
+    );
+
+    // image_sample_d_o (0x032): v5 = imm offset (+1, +1), v6..v9 = zero grads, v10..v11 = u,v.
+    let sample_d_o = build_sample_cs(&[
+        vop1(0x001, 5, 0xFF),
+        0x0000_0101,
+        vop1(0x001, 6, 0x80),
+        vop1(0x001, 7, 0x80),
+        vop1(0x001, 8, 0x80),
+        vop1(0x001, 9, 0x80),
+        vop1(0x001, 10, vgpr(1)),
+        vop1(0x001, 11, vgpr(2)),
+        mimg_sample(0x032, 0x1, 1, 12, 5, 16, 12)[0],
+        mimg_sample(0x032, 0x1, 1, 12, 5, 16, 12)[1],
+        vop1(0x001, 8, vgpr(12)),
+        vop1(0x001, 9, 0x80),
+        vop1(0x001, 10, 0x80),
+        vop1(0x001, 11, 0x80),
+    ]);
+    run_sample_cases(
+        &sample_d_o,
+        &texels,
+        point_sampler,
+        &[([f(0.125), f(0.125), 0, 0], [5.0, 0.0, 0.0, 0.0])],
+    );
+
+    // Pixel-only offset variants: image_sample_b_o (0x035) and image_sample_c_o (0x038).
+    for op in [0x035u16, 0x038] {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(1, 0x80));
+        words.push(s_mov_b32(3, 0x80));
+        words.extend_from_slice(&s_load_dwords(0x03, 16, 0, 0));
+        words.extend_from_slice(&s_load_dwords(0x02, 12, 2, 0));
+        words.extend_from_slice(&[vop1(0x001, 1, 0xFF), 0x0000_0101]);
+        words.push(vop1(0x001, 2, 0xF0));
+        words.push(vop1(0x001, 3, 0xF0));
+        words.push(vop1(0x001, 4, 0xF0));
+        words.extend_from_slice(&mimg_sample(op, 0x1, 1, 0, 1, 16, 12));
+        words.extend_from_slice(&[0xF800_180F, 0x0000_0000]);
+        words.push(S_ENDPGM);
+
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Sampler,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: vec![SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+
+        let ps = HostShader {
+            stage: HwStage::Ps,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers.iter().map(|&(w, _)| w).collect(),
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut ps.dxil.clone())
+                .unwrap_or_else(|e| panic!("DXIL validation failed for op {op:#x}: {e}"));
+        }
+        let vs = stub_vs(&ps).expect("stub_vs");
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let host = Host::new(true).expect("WARP host");
+        host.pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("graphics PSO failed for op {op:#x}: {e}"));
+    }
 }

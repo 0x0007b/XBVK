@@ -369,6 +369,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    let mut first_halves: Vec<(Site, Attribute, Option<Value>)> = Vec::new();
+    let mut p2_accs: std::collections::HashSet<(Site, Value)> = std::collections::HashSet::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,19 +384,24 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => {
+                            let out = match *dst {
+                                Operand::Vector { reg, .. } => inst.write(Reg::V(reg)),
+                                _ => None,
+                            };
+                            first_halves.push((site, attribute, out));
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
                             };
                             // The first half's result is this one's old dst.
+                            let acc = inst.read(Reg::V(d));
+                            if let Some(v) = acc {
+                                p2_accs.insert((site, v));
+                            }
                             let interp = halves
-                                .pair(
-                                    attr,
-                                    inst.read(Reg::V(d)),
-                                    inst.read(Reg::V(reg)),
-                                    &barycentric,
-                                )
+                                .pair(attr, acc, inst.read(Reg::V(reg)), &barycentric)
                                 .map_err(|what| unsupported(at, what))?;
                             push_pair(&mut io, site, interp, attribute);
                         }
@@ -402,15 +409,26 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => {
+                        let attribute = attribute(inst, &v.src[0])?;
+                        let out = match v.dst {
+                            Some(Operand::Vector { reg, .. }) => inst.write(Reg::V(reg)),
+                            _ => None,
+                        };
+                        first_halves.push((site, attribute, out));
+                    }
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
                             Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
                             _ => None,
                         };
+                        let acc = read(2);
+                        if let Some(a) = acc {
+                            p2_accs.insert((site, a));
+                        }
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
+                            .pair(&v.src[0], acc, read(1), &barycentric)
                             .map_err(|what| unsupported(at, what))?;
                         push_pair(&mut io, site, interp, attribute);
                     }
@@ -457,6 +475,35 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     });
                 }
                 _ => {}
+            }
+        }
+    }
+    if !first_halves.is_empty() {
+        let mut read = std::collections::HashSet::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.reads {
+                    if !p2_accs.contains(&((b, i), v)) {
+                        read.insert(v);
+                    }
+                }
+            }
+        }
+        let mut work: Vec<Value> = read.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            if let Some(&(b, i)) = phis.get(&v) {
+                for &arg in &p.blocks[b].phis[i].args {
+                    if read.insert(arg) {
+                        work.push(arg);
+                    }
+                }
+            }
+        }
+        for (site, attribute, out) in first_halves {
+            if out.is_some_and(|v| read.contains(&v))
+                && !io.interps.iter().any(|(s, _)| *s == site)
+            {
+                io.interps.push((site, Interp::Weighted { attribute }));
             }
         }
     }
@@ -686,6 +733,31 @@ mod tests {
             (Target::Color(0), true, false)
         );
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
+    }
+
+    #[test]
+    fn standalone_first_half_of_interpolation_uses_weighted() {
+        let p = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0302_0102, // exp mrt0, v2, v1, v2, v3 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(
+            io.interps,
+            [(
+                (0, 0),
+                Interp::Weighted {
+                    attribute: Attribute {
+                        usage: Usage::Generic,
+                        row: 1,
+                        channel: 0,
+                        high: false,
+                    }
+                }
+            )]
+        );
     }
 
     #[test]
