@@ -262,6 +262,16 @@ const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 /// `title_textures` lets a queue have in flight); past it the biggest buffers are released
 const KEEP_BYTES: u64 = 512 << 20;
 
+fn staging_capacity(bytes: u64) -> Option<u64> {
+    const LARGE: u64 = 64 << 20;
+    const STEP: u64 = 16 << 20;
+    if bytes <= LARGE {
+        Some(bytes.max(STAGING_MIN).next_power_of_two())
+    } else {
+        bytes.checked_next_multiple_of(STEP)
+    }
+}
+
 impl Uploader {
     unsafe fn new(dev: &ID3D12Device) -> Result<Uploader, String> {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
@@ -278,7 +288,10 @@ impl Uploader {
                 return Ok((b.clone(), *p));
             }
         }
-        let cap = bytes.max(STAGING_MIN).next_power_of_two();
+        let cap = staging_capacity(bytes).ok_or("texture upload buffer size overflow")?;
+        // A cached uploader has passed its last copy fence. Return this reference before
+        // acquiring the replacement so the growth path does not keep two buffers itself.
+        drop(self.staging.take());
         let b = buffer(dev, cap)?;
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
