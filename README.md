@@ -2,7 +2,7 @@
 
 # XBVK / XCLVIC
 
-**Experimental Native Xbox Series X|S (`Scarlett`) Compatibility Layer for Windows**
+**Experimental Native Xbox Series X|S (`Scarlett` & `Victory`) Compatibility Layer for Windows**
 
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B%20%7C%20Edition%202024-orange?logo=rust)](Cargo.toml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20x64-0078D6?logo=windows)](docs/architecture.md)
